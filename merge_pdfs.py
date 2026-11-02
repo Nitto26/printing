@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
 PDF Hierarchy Merger
-Merges PDFs structured in nested folders:
-  Main Folder -> Level-1 Folders -> Level-2 Subfolders -> PDF files
-Traversal follows natural sort order (e.g. Folder 2 comes before Folder 10).
+Merges nested PDFs per first-level folder:
+  Main Folder/
+  ├── Folder A/                  -> merged into 'A.pdf'
+  │   ├── Subfolder P/
+  │   │   ├── doc_1.pdf
+  │   │   └── doc_2.pdf
+  │   ├── Subfolder Q/
+  │   │   ├── doc_1.pdf
+  │   │   └── doc_2.pdf
+  │   └── ...
+  ├── Folder B/                  -> merged into 'B.pdf'
+  │   ├── Subfolder P/
+  │   └── ...
 """
 
 import os
@@ -11,7 +21,7 @@ import sys
 import re
 import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 from pypdf import PdfWriter, PdfReader
 from tqdm import tqdm
 
@@ -25,28 +35,34 @@ def natural_sort_key(s: str | Path):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', name)]
 
 
-def collect_pdf_files(main_folder: Path) -> List[Tuple[Path, Path, Path]]:
+def collect_pdfs_by_parent(main_folder: Path, exclude_dir_names: set = None) -> Dict[Path, List[Tuple[Path, Path]]]:
     """
-    Traverses the directory structure:
-      main_folder -> level_1_folder -> level_2_folder -> pdf files
-    Returns a list of tuples: (level_1_path, level_2_path, pdf_path) in the specified traversal order.
+    Scans the directory structure:
+      main_folder -> Level-1 Folders (A, B, C...) -> Level-2 Subfolders (P, Q, R...) -> PDF files
+    
+    Returns a dictionary mapping:
+      Level-1 Folder Path -> List of (Level-2 Subfolder Path, PDF Path)
     """
     if not main_folder.is_dir():
         raise NotADirectoryError(f"Main folder not found: {main_folder}")
 
-    # Discover level 1 folders
-    level_1_dirs = [d for d in main_folder.iterdir() if d.is_dir()]
+    if exclude_dir_names is None:
+        exclude_dir_names = {"merged_pdfs", "merged_outputs"}
+
+    level_1_dirs = [
+        d for d in main_folder.iterdir() 
+        if d.is_dir() and d.name not in exclude_dir_names
+    ]
     level_1_dirs.sort(key=natural_sort_key)
 
-    collected: List[Tuple[Path, Path, Path]] = []
+    result: Dict[Path, List[Tuple[Path, Path]]] = {}
 
     for l1 in level_1_dirs:
-        # Discover level 2 folders
         level_2_dirs = [d for d in l1.iterdir() if d.is_dir()]
         level_2_dirs.sort(key=natural_sort_key)
 
+        folder_pdfs: List[Tuple[Path, Path]] = []
         for l2 in level_2_dirs:
-            # Discover PDFs inside level 2 folder
             pdf_files = [
                 f for f in l2.iterdir() 
                 if f.is_file() and f.suffix.lower() == ".pdf"
@@ -54,106 +70,127 @@ def collect_pdf_files(main_folder: Path) -> List[Tuple[Path, Path, Path]]:
             pdf_files.sort(key=natural_sort_key)
 
             for pdf in pdf_files:
-                collected.append((l1, l2, pdf))
+                folder_pdfs.append((l2, pdf))
 
-    return collected
+        if folder_pdfs:
+            result[l1] = folder_pdfs
+
+    return result
 
 
-def merge_pdfs(
-    main_folder: Path,
+def merge_single_folder(
+    parent_folder: Path,
+    items: List[Tuple[Path, Path]],
     output_pdf: Path,
-    add_bookmarks: bool = True,
-    dry_run: bool = False
+    add_bookmarks: bool = True
 ) -> int:
     """
-    Gathers PDFs in hierarchical order and merges them into a single PDF.
+    Merges all PDFs belonging to one Level-1 folder into a single PDF file.
     """
-    print(f"\nScanning main folder: {main_folder.resolve()}")
-    items = collect_pdf_files(main_folder)
-
-    if not items:
-        print("No PDF files found matching the 2-level folder structure.")
-        return 0
-
-    print(f"Discovered {len(items)} PDF file(s) across subfolders.\n")
-
-    if dry_run:
-        print("=== DRY RUN: Merge Sequence Preview ===")
-        for idx, (l1, l2, pdf) in enumerate(items, 1):
-            rel_path = pdf.relative_to(main_folder)
-            print(f"  [{idx:3d}] {rel_path}")
-        print("========================================")
-        print("Dry run completed. No files were modified.")
-        return len(items)
-
     writer = PdfWriter()
-    current_l1 = None
     current_l2 = None
-    l1_bookmark = None
     l2_bookmark = None
     total_pages = 0
 
-    print("Merging PDFs in progress...")
-    with tqdm(total=len(items), desc="Merging files", unit="pdf") as pbar:
-        for l1, l2, pdf_path in items:
-            pbar.set_postfix_str(pdf_path.name[:25])
-            try:
-                reader = PdfReader(str(pdf_path))
-                num_pages = len(reader.pages)
+    for l2, pdf_path in items:
+        try:
+            reader = PdfReader(str(pdf_path))
+            num_pages = len(reader.pages)
+            if num_pages == 0:
+                continue
 
-                if num_pages == 0:
-                    pbar.write(f"[WARNING] Skipping empty PDF: {pdf_path}")
-                    pbar.update(1)
-                    continue
+            start_page_index = len(writer.pages)
 
-                start_page_index = len(writer.pages)
-
-                # Add bookmark hierarchy for easy navigation in PDF readers
-                if add_bookmarks:
-                    if l1 != current_l1:
-                        current_l1 = l1
-                        l1_bookmark = writer.add_outline_item(
-                            title=l1.name,
-                            page_number=start_page_index
-                        )
-                        current_l2 = None
-
-                    if l2 != current_l2:
-                        current_l2 = l2
-                        l2_bookmark = writer.add_outline_item(
-                            title=l2.name,
-                            page_number=start_page_index,
-                            parent=l1_bookmark
-                        )
-
-                    # Add file bookmark under subfolder
-                    writer.add_outline_item(
-                        title=pdf_path.name,
-                        page_number=start_page_index,
-                        parent=l2_bookmark
+            if add_bookmarks:
+                if l2 != current_l2:
+                    current_l2 = l2
+                    l2_bookmark = writer.add_outline_item(
+                        title=l2.name,
+                        page_number=start_page_index
                     )
 
-                # Append pages
-                for page in reader.pages:
-                    writer.add_page(page)
+                writer.add_outline_item(
+                    title=pdf_path.name,
+                    page_number=start_page_index,
+                    parent=l2_bookmark
+                )
 
-                total_pages += num_pages
+            for page in reader.pages:
+                writer.add_page(page)
 
-            except Exception as e:
-                pbar.write(f"[ERROR] Failed to process {pdf_path}: {e}")
+            total_pages += num_pages
+
+        except Exception as e:
+            print(f"\n[ERROR] Failed to read {pdf_path}: {e}")
+
+    if total_pages > 0:
+        output_pdf.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_pdf, "wb") as f_out:
+            writer.write(f_out)
+
+    return total_pages
+
+
+def process_batches(
+    main_folder: Path,
+    output_dir: Path,
+    add_bookmarks: bool = True,
+    dry_run: bool = False
+):
+    """
+    Processes all Level-1 folders and produces <folder_name>.pdf for each.
+    """
+    print(f"\nScanning main folder: {main_folder.resolve()}")
+    grouped_data = collect_pdfs_by_parent(main_folder, exclude_dir_names={output_dir.name})
+
+    if not grouped_data:
+        print("No Level-1 folders with PDFs found.")
+        return
+
+    total_folders = len(grouped_data)
+    total_files = sum(len(items) for items in grouped_data.values())
+    print(f"Found {total_folders} parent folder(s) containing a total of {total_files} PDF(s).\n")
+
+    if dry_run:
+        print("=== DRY RUN: Preview of Output PDFs to be Created ===")
+        for idx, (l1, items) in enumerate(grouped_data.items(), 1):
+            target_name = f"{l1.name}.pdf"
+            print(f"\n[{idx}/{total_folders}] Parent Folder: '{l1.name}' --> '{target_name}' ({len(items)} PDFs):")
+            for l2, pdf in items:
+                print(f"      - {l2.name} / {pdf.name}")
+        print("\n" + "=" * 54)
+        print("Dry run completed. No files were written.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Merged PDFs will be saved to: {output_dir.resolve()}\n")
+
+    successful_merges = 0
+    total_pages_generated = 0
+
+    with tqdm(total=total_folders, desc="Processing folders", unit="folder") as pbar:
+        for l1, items in grouped_data.items():
+            target_pdf = output_dir / f"{l1.name}.pdf"
+            pbar.set_postfix_str(f"Merging -> {target_pdf.name}")
+
+            pages = merge_single_folder(
+                parent_folder=l1,
+                items=items,
+                output_pdf=target_pdf,
+                add_bookmarks=add_bookmarks
+            )
+
+            if pages > 0:
+                successful_merges += 1
+                total_pages_generated += pages
 
             pbar.update(1)
 
-    output_pdf.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_pdf, "wb") as f_out:
-        writer.write(f_out)
-
-    print(f"\nSuccessfully created merged PDF!")
-    print(f"Output File: {output_pdf.resolve()}")
-    print(f"Total PDFs merged: {len(items)}")
-    print(f"Total Pages: {total_pages}\n")
-
-    return len(items)
+    print("\n" + "=" * 54)
+    print(f"Done! Successfully created {successful_merges} merged PDF file(s).")
+    print(f"Total Pages Generated: {total_pages_generated}")
+    print(f"Output Directory: {output_dir.resolve()}")
+    print("=" * 54 + "\n")
 
 
 def pick_folder_gui() -> str:
@@ -173,36 +210,36 @@ def pick_folder_gui() -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge nested folder PDFs into a single combined PDF."
+        description="Merge nested PDFs per first-level folder into <folder_name>.pdf"
     )
     parser.add_argument(
         "-i", "--input",
-        help="Path to the main folder containing the subfolders.",
+        help="Path to the main folder containing the first bunch of folders (a, b, c...).",
         type=str,
         default=None
     )
     parser.add_argument(
-        "-o", "--output",
-        help="Path for the output merged PDF (default: <input_folder>/merged_output.pdf).",
+        "-o", "--output-dir",
+        help="Directory to save the merged PDFs (default: <main_folder>/merged_pdfs).",
         type=str,
         default=None
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview the exact sequence of files that would be merged without writing anything."
+        help="Preview the exact structure and files to be merged without writing anything."
     )
     parser.add_argument(
         "--no-bookmarks",
         action="store_true",
-        help="Disable adding folder/file bookmarks (table of contents) to the output PDF."
+        help="Disable adding subfolder/file bookmarks (table of contents) to each output PDF."
     )
 
     args = parser.parse_args()
 
     input_path_str = args.input
 
-    # If no input path provided, prompt GUI or terminal input
+    # If no input provided, prompt GUI or terminal input
     if not input_path_str:
         print("No input folder provided.")
         gui_selected = pick_folder_gui()
@@ -224,14 +261,14 @@ def main():
         print(f"Error: Directory '{main_dir}' does not exist.")
         sys.exit(1)
 
-    if args.output:
-        output_path = Path(args.output).resolve()
+    if args.output_dir:
+        output_dir = Path(args.output_dir).resolve()
     else:
-        output_path = main_dir / "merged_output.pdf"
+        output_dir = main_dir / "merged_pdfs"
 
-    merge_pdfs(
+    process_batches(
         main_folder=main_dir,
-        output_pdf=output_path,
+        output_dir=output_dir,
         add_bookmarks=not args.no_bookmarks,
         dry_run=args.dry_run
     )
@@ -239,4 +276,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
